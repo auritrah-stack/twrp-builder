@@ -15,21 +15,23 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config --global user.name "TWRP Builder"
-          git config --global user.email "builder@example.com"
+          git config --global user.name "suritra-stack"
+          git config --global user.email "builder@localhost"
 
       - name: Sync TWRP 11 Minimal Manifest
         run: |
           mkdir -p ~/twrp && cd ~/twrp
-          MANIFEST_REPO="minimal-manifest-twrp/platform_manifest_twrp_omni.git"
-          repo init --depth=1 -u "https://github.com{MANIFEST_REPO}" -b twrp-11
+          HOST="github.com"
+          MANIFEST="minimal-manifest-twrp/platform_manifest_twrp_omni.git"
+          repo init --depth=1 -u "https://${HOST}/${MANIFEST}" -b twrp-11
           repo sync -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
 
       - name: Clone Symphony Z35 Device Tree
         run: |
-          USER_NAME="YOUR_GITHUB_USERNAME"
-          TREE_REPO="android_device_symphony_Z35.git"
-          git clone "https://github.com{USER_NAME}/${TREE_REPO}" ~/twrp/device/symphony/Z35
+          HOST="github.com"
+          OWNER="suritra-stack"
+          REPO="android_device_symphony_Z35.git"
+          git clone "https://${HOST}/${OWNER}/${REPO}" ~/twrp/device/symphony/Z35
 
       - name: Compile TWRP Recovery
         run: |
