@@ -1,102 +1,32 @@
-name: Build TWRP for Symphony Z35
+name: Build OrangeFox Recovery
 
 on:
   workflow_dispatch:
 
-env:
-  # Android 11 base to match the Z35 stock firmware. Use twrp-12.1 to try the newer tree.
-  TWRP_BRANCH: twrp-11
-  DEVICE_REPO: https://github.com/auritrah-stack/android_device_symphony_Z35
-  DEVICE_DIR: device/symphony/Z35
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    name: Compile OrangeFox for Symphony Z35
+    runs-on: ubuntu-22.04          # NOT ubuntu-latest (24.04 breaks the 12.1 toolchain)
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FOX_BUILD_DEVICE: Z35
+
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          sudo docker image prune --all --force || true
-          df -h /
+      - name: Checkout Device Tree
+        uses: actions/checkout@v4
 
-      - name: Install build dependencies and repo
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python-is-python3 libc6-dev-i386 x11proto-core-dev libx11-dev unzip
-          mkdir -p ~/bin
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
-          chmod a+rx ~/bin/repo
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Configure git
-        run: |
-          git config --global user.name "twrp-builder"
-          git config --global user.email "builder@localhost"
-          git config --global color.ui false
-
-      - name: Sync TWRP minimal manifest
-        run: |
-          mkdir -p ~/twrp && cd ~/twrp
-          repo init --depth=1 --no-repo-verify -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b "$TWRP_BRANCH"
-          repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
-
-      - name: Clone Symphony Z35 device tree
-        run: |
-          GIT_TERMINAL_PROMPT=0 git clone --depth=1 "$DEVICE_REPO" ~/twrp/"$DEVICE_DIR"
-
-      - name: Prepare device tree
-        shell: bash
-        run: |
-          cd ~/twrp/"$DEVICE_DIR"
-
-          # The AOSP-based TWRP manifests need "twrp_" product makefiles. Convert an omni_ tree if that is what we got.
-          if ! ls twrp_*.mk >/dev/null 2>&1 && ls omni_*.mk >/dev/null 2>&1; then
-            echo "omni_ product files found, converting to twrp_"
-            for f in omni_*.mk; do mv "$f" "twrp_${f#omni_}"; done
-            if [ -f omni.dependencies ]; then mv omni.dependencies twrp.dependencies; fi
-            sed -i -e 's#vendor/omni/config/common.mk#vendor/twrp/config/common.mk#g' -e 's#omni_#twrp_#g' ./*.mk
-          fi
-
-          # Repair twrp.flags / fstab lines where the columns were glued together
-          # (".../by-name/cacheflags=..." and "/vbmeta_systememmc").
-          find . -type f \( -name 'twrp.flags' -o -name 'twrp.fstab' -o -name 'recovery.fstab' \) | while read -r f; do
-            sed -E -i \
-              -e 's#^(/[a-z0-9_]+)(emmc|ext4|f2fs|vfat)([[:space:]]+/dev/)#\1\t\2\3#' \
-              -e 's#(/dev/[^[:space:]]*/by-name/[a-z0-9_]+)flags=#\1\tflags=#' "$f"
-            echo "checked $f"
-          done
-
-          MK=$(ls twrp_*.mk 2>/dev/null | head -n1 || true)
-          if [ -z "$MK" ]; then
-            echo "::error::No twrp_*.mk found in the device tree root"
-            ls -la
-            exit 1
-          fi
-          echo "LUNCH_TARGET=${MK%.mk}-eng" >> "$GITHUB_ENV"
-          echo "Will build: ${MK%.mk}-eng"
-
-      - name: Compile TWRP recovery
-        shell: bash
-        run: |
-          cd ~/twrp
-          export ALLOW_MISSING_DEPENDENCIES=true
-          export LC_ALL=C
-          source build/envsetup.sh
-          lunch "$LUNCH_TARGET"
-          mka recoveryimage 2>&1 | tee ~/build.log
-
-      - name: Upload finished recovery image
-        uses: actions/upload-artifact@v4
+      - name: Build OrangeFox Recovery
+        uses: UWU-TEAM/UWU-OrangeFox-Builder@v1.0.0
         with:
-          name: TWRP-Symphony-Z35
-          path: /home/runner/twrp/out/target/product/*/recovery.img
-          if-no-files-found: error
-
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: /home/runner/build.log
-          if-no-files-found: ignore
+          USER_NAME: 'auritrah-stack'
+          USER_EMAIL: 'auritrah-stack@users.noreply.github.com'
+          FOX_SYNC_BRANCH: '12.1'
+          DEVICE_TREE: 'https://github.com/auritrah-stack/android_device_symphony_Z35'
+          DEVICE_TREE_BRANCH: 'main'
+          DEVICE_PATH: 'device/symphony/Z35'
+          DEVICE_NAME: 'Z35'
+          BUILD_TARGET: 'recovery'      # this phone has a real recovery partition
+          GH_RELEASE: 'true'
