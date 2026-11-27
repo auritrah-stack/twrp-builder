@@ -14,6 +14,15 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       FOX_BUILD_DEVICE: Z35
 
+      # ---- Size reduction (image was 39,471,104 B, limit is 33,484,800 B) ----
+      FOX_USE_LZMA_COMPRESSION: "1"      # biggest saver (needs CONFIG_RD_LZMA=y in kernel)
+      LZMA_RAMDISK_TARGETS: "recovery"
+      FOX_DELETE_AROMAFM: "1"
+      FOX_REMOVE_AAPT: "1"
+      FOX_EXCLUDE_NANO_EDITOR: "1"
+      FOX_ENABLE_APP_MANAGER: "0"
+      OF_SKIP_MULTIPLE_LANGUAGES: "1"
+
     steps:
       - name: Checkout Device Tree
         uses: actions/checkout@v4
