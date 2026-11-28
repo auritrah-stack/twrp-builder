@@ -9,13 +9,14 @@ on:
         default: main
         type: string
       build_jobs:
-        description: 'Parallel build jobs (keep at 4 on standard 16 GB runners)'
+        description: 'Parallel build jobs (keep at 4 on a 16 GB runner)'
         required: true
         default: '4'
         type: choice
         options:
           - '2'
           - '4'
+          - '6'
 
 permissions:
   contents: read
@@ -37,34 +38,55 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Set Z35_RUNNER_LABEL only when selecting a custom/self-hosted runner.
+    # The workflow reclaims unused tools on ephemeral GitHub-hosted runners.
+    runs-on: ${{ vars.Z35_RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 360
 
     steps:
-      - name: Free up disk space on standard GitHub runner
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          echo "=== Disk before cleanup ==="
-          df -h "$GITHUB_WORKSPACE"
-          sudo rm -rf /usr/share/dotnet \
-                      /usr/local/lib/android \
-                      /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL \
-                      /usr/local/share/boost
-          sudo docker system prune -af || true
-          sudo apt-get clean
-          echo "=== Disk after cleanup ==="
-          df -h "$GITHUB_WORKSPACE"
-
       - name: Check out the Z35 device tree
         uses: actions/checkout@v4
         with:
           repository: auritrah-stack/twrp_device_symphony_Z35
           ref: ${{ inputs.device_tree_ref }}
+          # Keep the source checkout separate until repo sync is complete.
+          # The repository has a top-level Z35/ directory.
           path: device-tree
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Reclaim unused space on ephemeral GitHub-hosted runner
+        shell: bash
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -Eeuo pipefail
+          echo '=== Disk before cleanup ==='
+          df -h "$GITHUB_WORKSPACE"
+
+          if [[ "$RUNNER_ENVIRONMENT" == 'github-hosted' ]]; then
+            # These preinstalled toolchains are not used by this workflow.
+            # Do not run this destructive cleanup on a self-hosted runner.
+            sudo rm -rf \
+              /usr/local/lib/android \
+              /usr/share/dotnet \
+              /opt/ghc \
+              /usr/local/.ghcup \
+              /usr/share/swift \
+              /opt/hostedtoolcache \
+              /usr/local/share/powershell \
+              /usr/local/share/chromium \
+              /usr/local/share/chromedriver
+            sudo apt-get clean
+            if command -v docker >/dev/null 2>&1; then
+              sudo docker system prune --all --force --volumes || true
+            fi
+          else
+            echo 'Self-hosted runner detected; skipping destructive disk cleanup.'
+          fi
+
+          echo '=== Disk after cleanup ==='
+          df -h "$GITHUB_WORKSPACE"
 
       - name: Export manual build options
         shell: bash
@@ -72,155 +94,4 @@ jobs:
           DEVICE_TREE_REF: ${{ inputs.device_tree_ref }}
           BUILD_JOBS: ${{ inputs.build_jobs }}
         run: |
-          set -Eeuo pipefail
-          echo "DEVICE_TREE_REF=$DEVICE_TREE_REF" >> "$GITHUB_ENV"
-          echo "BUILD_JOBS=$BUILD_JOBS" >> "$GITHUB_ENV"
 
-      - name: Verify device-tree layout
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          test -s "$DEVICE_TREE_CHECKOUT_DIR/BoardConfig.mk"
-          test -s "$DEVICE_TREE_CHECKOUT_DIR/AndroidProducts.mk"
-          test -s "$DEVICE_TREE_CHECKOUT_DIR/twrp_Z35.mk"
-          test -s "$DEVICE_TREE_CHECKOUT_DIR/recovery.fstab"
-          test -s "$DEVICE_TREE_CHECKOUT_DIR/prebuilt/kernel"
-          test -s "$DEVICE_TREE_CHECKOUT_DIR/prebuilt/dtb.img"
-          test -s "$DEVICE_TREE_CHECKOUT_DIR/prebuilt/dtbo.img"
-          test -s "$DEVICE_TREE_CHECKOUT_DIR/prebuilt/SHA256SUMS"
-          echo 'PASS: device tree layout verified.'
-
-      - name: Install Android build dependencies
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc \
-            bison \
-            build-essential \
-            ca-certificates \
-            ccache \
-            curl \
-            flex \
-            g++-multilib \
-            gcc-multilib \
-            git \
-            git-lfs \
-            gnupg \
-            gperf \
-            imagemagick \
-            lib32ncurses5-dev \
-            lib32z1-dev \
-            libelf-dev \
-            liblz4-tool \
-            libncurses5-dev \
-            libssl-dev \
-            libxml2 \
-            libxml2-utils \
-            lzop \
-            openjdk-11-jdk-headless \
-            pngcrush \
-            python3 \
-            python-is-python3 \
-            rsync \
-            schedtool \
-            squashfs-tools \
-            unzip \
-            xsltproc \
-            zip \
-            zlib1g-dev
-
-      - name: Install Google repo launcher
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p "$HOME/bin"
-          curl --fail --location --retry 5 --retry-all-errors \
-            https://storage.googleapis.com/git-repo-downloads/repo \
-            --output "$HOME/bin/repo"
-          chmod 0755 "$HOME/bin/repo"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Initialize and sync TWRP 12.1 source
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p "$SOURCE_DIR"
-          cd "$SOURCE_DIR"
-          repo init --depth=1 \
-            -u "$MANIFEST_URL" \
-            -b "$MANIFEST_BRANCH"
-          repo sync \
-            --force-sync \
-            --no-clone-bundle \
-            --no-tags \
-            --prune \
-            -j"$SYNC_JOBS" 2>&1 | tee "$GITHUB_WORKSPACE/repo-sync.log"
-          repo manifest -r -o "$GITHUB_WORKSPACE/manifest-revisions.xml"
-
-      - name: Place and validate device tree
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p "$SOURCE_DIR/device/symphony" "$ARTIFACT_DIR"
-          rm -rf "$DEVICE_TREE_DIR"
-          cp -a "$DEVICE_TREE_CHECKOUT_DIR" "$DEVICE_TREE_DIR"
-
-          BOARD_CONFIG="$DEVICE_TREE_DIR/BoardConfig.mk"
-          cp "$BOARD_CONFIG" "$ARTIFACT_DIR/BoardConfig.before-build.mk"
-          if grep -qx 'PLATFORM_VERSION := 16.1.0' "$BOARD_CONFIG"; then
-            sed -i '/^PLATFORM_VERSION := 16\.1\.0$/d' "$BOARD_CONFIG"
-          fi
-          diff -u "$ARTIFACT_DIR/BoardConfig.before-build.mk" "$BOARD_CONFIG" \
-            > "$ARTIFACT_DIR/BoardConfig-build-adjustment.diff" || true
-
-          (
-            cd "$DEVICE_TREE_DIR"
-            sha256sum --check prebuilt/SHA256SUMS
-          ) | tee "$GITHUB_WORKSPACE/device-tree-prebuilt-check.log"
-
-          if [ -f "$DEVICE_TREE_DIR/scripts/validate-device-tree.sh" ]; then
-            bash "$DEVICE_TREE_DIR/scripts/validate-device-tree.sh" \
-              2>&1 | tee "$GITHUB_WORKSPACE/device-tree-validation.log"
-          fi
-
-      - name: Build TWRP recovery image
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$SOURCE_DIR"
-          export ALLOW_MISSING_DEPENDENCIES=true
-          set +u
-          source build/envsetup.sh
-          lunch twrp_Z35-eng
-          set -u
-          mka recoveryimage -j"$BUILD_JOBS"
-
-      - name: Verify image size and stage artifacts
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          RECOVERY_IMG="$SOURCE_DIR/out/target/product/Z35/recovery.img"
-          test -s "$RECOVERY_IMG"
-
-          ACTUAL_BYTES=$(stat -c%s "$RECOVERY_IMG")
-          echo "Built recovery.img size: $ACTUAL_BYTES bytes (Max allowed: $MAX_RECOVERY_BYTES bytes)"
-          if (( ACTUAL_BYTES > MAX_RECOVERY_BYTES )); then
-            echo "ERROR: recovery.img exceeds MAX_RECOVERY_BYTES ($MAX_RECOVERY_BYTES)" >&2
-            exit 1
-          fi
-
-          cp "$RECOVERY_IMG" "$ARTIFACT_DIR/recovery.img"
-          sha256sum "$ARTIFACT_DIR/recovery.img" > "$ARTIFACT_DIR/recovery.img.sha256"
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: twrp-Z35-${{ github.run_number }}
-          path: |
-            ${{ env.ARTIFACT_DIR }}/recovery.img
-            ${{ env.ARTIFACT_DIR }}/recovery.img.sha256
-            ${{ env.ARTIFACT_DIR }}/BoardConfig-build-adjustment.diff
-            ${{ github.workspace }}/manifest-revisions.xml
-          retention-days: 14
