@@ -1,41 +1,338 @@
-name: Build OrangeFox Recovery
+name: Build Symphony Z35 TWRP 12.1
 
 on:
   workflow_dispatch:
+    inputs:
+      device_tree_ref:
+        description: 'Branch, tag, or commit of auritrah-stack/twrp_device_symphony_Z35'
+        required: true
+        default: main
+        type: string
+      build_jobs:
+        description: 'Parallel build jobs (keep at 4 on a 16 GB runner)'
+        required: true
+        default: '4'
+        type: choice
+        options:
+          - '2'
+          - '4'
+          - '6'
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  MANIFEST_URL: https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
+  MANIFEST_BRANCH: twrp-12.1
+  DEVICE_TREE_REPOSITORY: auritrah-stack/twrp_device_symphony_Z35
+  DEVICE_TREE_CHECKOUT_DIR: ${{ github.workspace }}/device-tree/Z35
+  DEVICE_TREE_DIR: ${{ github.workspace }}/twrp/device/symphony/Z35
+  SOURCE_DIR: ${{ github.workspace }}/twrp
+  ARTIFACT_DIR: ${{ github.workspace }}/z35-build-artifacts
+  MAX_RECOVERY_BYTES: '33554432'
+  SYNC_JOBS: '4'
+
+concurrency:
+  group: z35-twrp-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Compile OrangeFox for Symphony Z35
-    runs-on: ubuntu-22.04          # NOT ubuntu-latest (24.04 breaks the 12.1 toolchain)
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      FOX_BUILD_DEVICE: Z35
-
-      # ---- Size reduction (image was 39,471,104 B, limit is 33,484,800 B) ----
-      FOX_USE_LZMA_COMPRESSION: "1"      # biggest saver (needs CONFIG_RD_LZMA=y in kernel)
-      LZMA_RAMDISK_TARGETS: "recovery"
-      FOX_DELETE_AROMAFM: "1"
-      FOX_REMOVE_AAPT: "1"
-      FOX_EXCLUDE_NANO_EDITOR: "1"
-      FOX_ENABLE_APP_MANAGER: "0"
-      OF_SKIP_MULTIPLE_LANGUAGES: "1"
+    # Set the repository Actions variable Z35_RUNNER_LABEL to the label/name
+    # of a Linux x86_64 runner with >=120 GiB free disk and >=14 GiB RAM.
+    # Without it, the standard ubuntu-latest runner is selected and the
+    # preflight below will stop it because standard runners have only 14 GB SSD.
+    runs-on: ${{ vars.Z35_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout Device Tree
+      - name: Check out the Z35 device tree
         uses: actions/checkout@v4
-
-      - name: Build OrangeFox Recovery
-        uses: UWU-TEAM/UWU-OrangeFox-Builder@v1.0.0
         with:
-          USER_NAME: 'auritrah-stack'
-          USER_EMAIL: 'auritrah-stack@users.noreply.github.com'
-          FOX_SYNC_BRANCH: '12.1'
-          DEVICE_TREE: 'https://github.com/auritrah-stack/android_device_symphony_Z35'
-          DEVICE_TREE_BRANCH: 'main'
-          DEVICE_PATH: 'device/symphony/Z35'
-          DEVICE_NAME: 'Z35'
-          BUILD_TARGET: 'recovery'      # this phone has a real recovery partition
-          GH_RELEASE: 'true'
+          repository: auritrah-stack/twrp_device_symphony_Z35
+          ref: ${{ inputs.device_tree_ref }}
+          # Keep the source checkout separate until repo sync is complete.
+          # The repository has a top-level Z35/ directory.
+          path: device-tree
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Export manual build options
+        shell: bash
+        env:
+          DEVICE_TREE_REF: ${{ inputs.device_tree_ref }}
+          BUILD_JOBS: ${{ inputs.build_jobs }}
+        run: |
+          set -Eeuo pipefail
+          echo "DEVICE_TREE_REF=$DEVICE_TREE_REF" >> "$GITHUB_ENV"
+          echo "BUILD_JOBS=$BUILD_JOBS" >> "$GITHUB_ENV"
+
+      - name: Check runner capacity and device-tree layout
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo '=== Runner ==='
+          uname -a
+          echo "CPU cores: $(nproc)"
+          echo "Memory: $(awk '/MemTotal/ {printf "%.1f GiB\n", $2/1024/1024}' /proc/meminfo)"
+          df -h "$GITHUB_WORKSPACE"
+
+          [[ "$(uname -m)" == "x86_64" ]] || {
+            echo 'ERROR: This Android 12.1 build job requires a Linux x86_64 runner.' >&2
+            exit 1
+          }
+
+          FREE_GIB="$(df -BG --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -dc '0-9')"
+          MEM_KIB="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+          CPU_COUNT="$(nproc)"
+          echo "Available disk: ${FREE_GIB} GiB"
+
+          if (( FREE_GIB < 120 )); then
+            echo 'ERROR: At least 120 GiB of free disk is required before syncing Android source.' >&2
+            echo 'The standard GitHub-hosted ubuntu-latest runner has only 14 GB SSD and cannot build this tree.' >&2
+            echo 'Use a larger runner (150 GB minimum; 300 GB recommended) or a self-hosted Linux runner.' >&2
+            exit 1
+          fi
+          if (( MEM_KIB < 14 * 1024 * 1024 )); then
+            echo 'ERROR: At least 14 GiB RAM is required; 16 GiB minimum is recommended.' >&2
+            exit 1
+          fi
+          if (( CPU_COUNT < 4 )); then
+            echo 'ERROR: At least 4 CPU cores are required for a practical build.' >&2
+            exit 1
+          fi
+
+          test -s "$DEVICE_TREE_CHECKOUT_DIR/BoardConfig.mk"
+          test -s "$DEVICE_TREE_CHECKOUT_DIR/AndroidProducts.mk"
+          test -s "$DEVICE_TREE_CHECKOUT_DIR/twrp_Z35.mk"
+          test -s "$DEVICE_TREE_CHECKOUT_DIR/recovery.fstab"
+          test -s "$DEVICE_TREE_CHECKOUT_DIR/prebuilt/kernel"
+          test -s "$DEVICE_TREE_CHECKOUT_DIR/prebuilt/dtb.img"
+          test -s "$DEVICE_TREE_CHECKOUT_DIR/prebuilt/dtbo.img"
+          test -s "$DEVICE_TREE_CHECKOUT_DIR/prebuilt/SHA256SUMS"
+          echo 'PASS: device tree is at device/symphony/Z35 and required files exist.'
+
+      - name: Install Android build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            ccache \
+            curl \
+            flex \
+            g++-multilib \
+            gcc-multilib \
+            git \
+            git-lfs \
+            gnupg \
+            gperf \
+            imagemagick \
+            lib32ncurses5-dev \
+            lib32z1-dev \
+            libelf-dev \
+            liblz4-tool \
+            libncurses5-dev \
+            libssl-dev \
+            libxml2 \
+            libxml2-utils \
+            lzop \
+            openjdk-11-jdk-headless \
+            pngcrush \
+            python3 \
+            python-is-python3 \
+            rsync \
+            schedtool \
+            squashfs-tools \
+            unzip \
+            xsltproc \
+            zip \
+            zlib1g-dev
+          java -version
+          git --version
+          python3 --version
+
+      - name: Install Google repo launcher
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$HOME/bin"
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            --output "$HOME/bin/repo"
+          chmod 0755 "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/repo" version
+
+      - name: Initialize TWRP 12.1 source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$SOURCE_DIR"
+          cd "$SOURCE_DIR"
+          repo init --depth=1 \
+            -u "$MANIFEST_URL" \
+            -b "$MANIFEST_BRANCH"
+
+      - name: Sync TWRP source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$SOURCE_DIR"
+          repo sync \
+            --force-sync \
+            --no-clone-bundle \
+            --no-tags \
+            --prune \
+            -j"$SYNC_JOBS" 2>&1 | tee "$GITHUB_WORKSPACE/repo-sync.log"
+          repo manifest -r -o "$GITHUB_WORKSPACE/manifest-revisions.xml"
+
+      - name: Place device tree in the Android source tree
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -d "$DEVICE_TREE_CHECKOUT_DIR"
+          mkdir -p "$SOURCE_DIR/device/symphony"
+          rm -rf "$DEVICE_TREE_DIR"
+          cp -a "$DEVICE_TREE_CHECKOUT_DIR" "$DEVICE_TREE_DIR"
+          test -s "$DEVICE_TREE_DIR/BoardConfig.mk"
+
+      - name: Apply TWRP-branch compatibility adjustment and validate device tree
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+          BOARD_CONFIG="$DEVICE_TREE_DIR/BoardConfig.mk"
+
+          # The device tree was also used for an OrangeFox 16.1 build. That
+          # PLATFORM_VERSION override is not the Android platform version of
+          # the TWRP 12.1 manifest. Remove only this exact stale override in
+          # the Actions workspace; the source repository is not modified.
+          cp "$BOARD_CONFIG" "$ARTIFACT_DIR/BoardConfig.before-build.mk"
+          if grep -qx 'PLATFORM_VERSION := 16.1.0' "$BOARD_CONFIG"; then
+            sed -i '/^PLATFORM_VERSION := 16\.1\.0$/d' "$BOARD_CONFIG"
+          fi
+          diff -u "$ARTIFACT_DIR/BoardConfig.before-build.mk" "$BOARD_CONFIG" \
+            > "$ARTIFACT_DIR/BoardConfig-build-adjustment.diff" || true
+
+          (
+            cd "$DEVICE_TREE_DIR"
+            sha256sum --check prebuilt/SHA256SUMS
+          ) | tee "$GITHUB_WORKSPACE/device-tree-prebuilt-check.log"
+
+          bash "$DEVICE_TREE_DIR/scripts/validate-device-tree.sh" \
+            2>&1 | tee "$GITHUB_WORKSPACE/device-tree-validation.log"
+
+          {
+            echo "Device tree: $DEVICE_TREE_REPOSITORY"
+            echo "Device tree ref: $DEVICE_TREE_REF"
+            echo "Device tree commit: $(git -C "$GITHUB_WORKSPACE/device-tree" rev-parse HEAD)"
+            echo "TWRP manifest: $MANIFEST_URL"
+            echo "TWRP branch: $MANIFEST_BRANCH"
+            echo "Target: twrp_Z35-eng / recoveryimage"
+            echo "Recovery partition limit: $MAX_RECOVERY_BYTES bytes"
+            echo "Build jobs: $BUILD_JOBS"
+            echo "Runner: $RUNNER_NAME"
+          } > "$ARTIFACT_DIR/build-metadata.txt"
+
+      - name: Build recovery image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$SOURCE_DIR"
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          source build/envsetup.sh
+          lunch twrp_Z35-eng
+          mka -j"$BUILD_JOBS" recoveryimage 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Validate recovery image and enforce 32 MiB partition limit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          IMAGE="$SOURCE_DIR/out/target/product/Z35/recovery.img"
+          CANDIDATE="$ARTIFACT_DIR/recovery_candidate.img"
+          mkdir -p "$ARTIFACT_DIR"
+
+          if [[ ! -s "$IMAGE" ]]; then
+            echo 'ERROR: Build completed without producing recovery.img.' >&2
+            exit 1
+          fi
+          cp "$IMAGE" "$CANDIDATE"
+
+          set +e
+          bash "$DEVICE_TREE_DIR/scripts/check-recovery-size.sh" "$CANDIDATE" \
+            > "$ARTIFACT_DIR/size-validation.log" 2>&1
+          SIZE_STATUS=$?
+          cat "$ARTIFACT_DIR/size-validation.log"
+          python3 "$DEVICE_TREE_DIR/scripts/check-recovery-image.py" \
+            "$CANDIDATE" --device-tree "$DEVICE_TREE_DIR" \
+            > "$ARTIFACT_DIR/boot-image-validation.log" 2>&1
+          IMAGE_STATUS=$?
+          cat "$ARTIFACT_DIR/boot-image-validation.log"
+          set -e
+
+          IMAGE_BYTES="$(stat -c '%s' "$CANDIDATE")"
+          echo "Image size: $IMAGE_BYTES bytes" | tee -a "$ARTIFACT_DIR/build-metadata.txt"
+          sha256sum "$CANDIDATE" | tee "$ARTIFACT_DIR/recovery-candidate.sha256"
+
+          if (( SIZE_STATUS == 0 && IMAGE_STATUS == 0 )); then
+            mv "$CANDIDATE" "$ARTIFACT_DIR/recovery.img"
+            echo 'STATIC_VALIDATION=PASS' >> "$ARTIFACT_DIR/build-metadata.txt"
+            echo 'DO_NOT_FLASH_UNTIL_BOOT_TESTED=YES' >> "$ARTIFACT_DIR/build-metadata.txt"
+            echo 'The image passed size, header-v2, kernel, DTB, and recovery-DTBO checks.'
+          else
+            mv "$CANDIDATE" "$ARTIFACT_DIR/recovery_DO_NOT_FLASH.img"
+            echo 'STATIC_VALIDATION=FAIL' >> "$ARTIFACT_DIR/build-metadata.txt"
+            echo 'DO_NOT_FLASH=YES' >> "$ARTIFACT_DIR/build-metadata.txt"
+            echo 'ERROR: Candidate image failed static validation; it is uploaded only for diagnosis.' >&2
+            exit 1
+          fi
+
+      - name: Upload recovery image and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Z35-TWRP-12.1-${{ github.run_number }}
+          path: |
+            z35-build-artifacts/**
+            build.log
+            repo-sync.log
+            manifest-revisions.xml
+            device-tree-prebuilt-check.log
+            device-tree-validation.log
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
+
+      - name: Write workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '# Symphony Z35 TWRP 12.1 build'
+            echo
+            echo "- Device tree: \`$DEVICE_TREE_REPOSITORY@$DEVICE_TREE_REF\`"
+            echo "- Manifest: \`$MANIFEST_BRANCH\`"
+            echo '- Product: `twrp_Z35-eng`'
+            echo '- Build target: `recoveryimage`'
+            echo '- Partition limit: 33,554,432 bytes (32 MiB)'
+            echo
+            if [[ -f "$ARTIFACT_DIR/build-metadata.txt" ]]; then
+              echo '```text'
+              cat "$ARTIFACT_DIR/build-metadata.txt"
+              echo '```'
+            fi
+            if [[ -f "$ARTIFACT_DIR/recovery.img" ]]; then
+              echo 'The recovery image passed the static size and embedded-component checks.'
+              echo 'It has **not** been boot-tested on the phone. Do not flash until boot-tested.'
+            elif [[ -f "$ARTIFACT_DIR/recovery_DO_NOT_FLASH.img" ]]; then
+              echo '**The candidate failed static validation. Do not flash it.**'
+            else
+              echo 'No validated recovery image was produced; inspect the build logs artifact.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
